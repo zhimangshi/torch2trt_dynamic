@@ -1,6 +1,7 @@
 import tensorrt as trt
 
 from .converters import *  # noqa: F401,F403
+from .scatter_nd import scatter_nd  # noqa: F401
 from .torch2trt_dynamic import *  # noqa: F401,F403
 
 
