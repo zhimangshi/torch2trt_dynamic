@@ -229,7 +229,13 @@ static void scatternd_custom_vdsp_i8_none(
     normalize_rank_dims(in_dims_in, rank, in_dims);
 
     const int32_t total = prod_i32(in_dims, RANK5);
-    memcpy((void*)out, (const void*)input, (size_t)total);
+    // IMPORTANT:
+    // Some MetaWare/clangac toolchain versions are unstable when lowering libc memcpy
+    // involving mixed address spaces (DDR <-> __vccm). Implement the copy explicitly
+    // to keep the IR simple and avoid instruction-selection crashes.
+    for (int32_t i = 0; i < total; ++i) {
+        out[i] = input[i];
+    }
 
     const int K = idx_dims[4];
     if (K <= 0 || K > rank) {
@@ -282,7 +288,10 @@ static void scatternd_custom_vdsp_i8_none(
         }
         const int32_t base = (int32_t)(d[0] * strides[0] + d[1] * strides[1] + d[2] * strides[2] +
                                       d[3] * strides[3] + d[4] * strides[4]);
-        memcpy((void*)&out[base], (const void*)&updates[row * slice_size], (size_t)slice_size);
+        const int upd_base = row * slice_size;
+        for (int t = 0; t < slice_size; ++t) {
+            out[base + t] = updates[upd_base + t];
+        }
     }
 }
 
