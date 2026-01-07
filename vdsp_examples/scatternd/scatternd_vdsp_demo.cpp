@@ -175,49 +175,34 @@ static void scatternd_custom_ref_i8_none(
         return;
     }
 
-    // Generic update: indices select the first K dims, remaining dims are copied from updates slice.
+    // Generic update (matches your custom_op semantics):
+    // - indices select the first K dims (dims 0..K-1)
+    // - the remaining (rank-K) dims form a contiguous slice in row-major memory
+    // - updates last dim is a flattened slice with the same row-major order
+    //
+    // Therefore the update can be done as:
+    //   base = sum_{k=0..K-1} selected[k] * stride[k]
+    //   for t in [0..slice_size): out[base + t] = updates[updates_base + t]
+    // This is exactly equivalent to the nested loops + updates_dim++ in the snippet.
+    int32_t strides[5];
+    compute_strides(in_dims, RANK5, strides);
+    const int32_t slice_size = upd_dims[4];
+
     for (uint32_t dim_0 = 0; dim_0 < (uint32_t)idx_dims[0]; dim_0++) {
         for (uint32_t dim_1 = 0; dim_1 < (uint32_t)idx_dims[1]; dim_1++) {
             for (uint32_t dim_2 = 0; dim_2 < (uint32_t)idx_dims[2]; dim_2++) {
                 for (uint32_t dim_3 = 0; dim_3 < (uint32_t)idx_dims[3]; dim_3++) {
-                    int selected[5] = {0, 0, 0, 0, 0};
+                    int32_t base = 0;
                     for (uint32_t k = 0; k < K; ++k) {
                         const int idx_pos = pos_idx5(idx_dims, (int)dim_0, (int)dim_1, (int)dim_2, (int)dim_3, (int)k);
-                        selected[k] = (int)indices[idx_pos];
+                        const int32_t selected = (int32_t)indices[idx_pos];
+                        base += selected * strides[k];
                     }
 
-                    // Remaining dims loop, following your snippet semantics:
-                    // updates is a flattened slice in its last dim (upd_dims[4] == slice_size)
-                    int updates_dim = 0;
-                    // Iterate dims from K..rank-1; for rank<5, trailing dims are 1 so loops collapse.
-                    for (uint32_t in_dK = 0; in_dK < (uint32_t)in_dims[K < 5 ? K : 4]; ++in_dK) {
-                        for (uint32_t in_dK1 = 0; in_dK1 < (uint32_t)in_dims[(K + 1) < 5 ? (K + 1) : 4]; ++in_dK1) {
-                            for (uint32_t in_dK2 = 0; in_dK2 < (uint32_t)in_dims[(K + 2) < 5 ? (K + 2) : 4]; ++in_dK2) {
-                                for (uint32_t in_dK3 = 0; in_dK3 < (uint32_t)in_dims[(K + 3) < 5 ? (K + 3) : 4]; ++in_dK3) {
-                                    // Map loop vars into d0..d4
-                                    int d[5] = {0, 0, 0, 0, 0};
-                                    for (int kk = 0; kk < (int)K; ++kk) d[kk] = selected[kk];
-
-                                    // Fill remaining dims in order
-                                    const int rem = rank - (int)K;
-                                    if (rem > 0) d[(int)K + 0] = (int)in_dK;
-                                    if (rem > 1) d[(int)K + 1] = (int)in_dK1;
-                                    if (rem > 2) d[(int)K + 2] = (int)in_dK2;
-                                    if (rem > 3) d[(int)K + 3] = (int)in_dK3;
-
-                                    const int out_pos = pos5(in_dims, d[0], d[1], d[2], d[3], d[4]);
-                                    const int updates_pos = pos_upd5(upd_dims, (int)dim_0, (int)dim_1, (int)dim_2, (int)dim_3, updates_dim++);
-                                    out[out_pos] = updates[updates_pos];  // reduction = NONE
-                                    if (updates_dim >= upd_dims[4]) {
-                                        // Done slice
-                                        goto slice_done;
-                                    }
-                                }
-                            }
-                        }
+                    const int updates_base = pos_upd5(upd_dims, (int)dim_0, (int)dim_1, (int)dim_2, (int)dim_3, 0);
+                    for (int32_t t = 0; t < slice_size; ++t) {
+                        out[base + t] = updates[updates_base + t];  // reduction = NONE
                     }
-                slice_done:
-                    (void)0;
                 }
             }
         }
