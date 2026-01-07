@@ -38,6 +38,13 @@ ScatterND 的难点是 **写地址不规则（随机写）**：
 
 - 用 predicate（`vvci_b() < n`）保护 tail lanes，避免越界。
 
+### 当前 demo 默认测试用例（便于看性能差异）
+
+`scatternd_vdsp_demo.cpp` 现在默认用 **`K == R`（`slice_size == 1`）的大量随机点写** 来测量：
+
+- 这是 `vscatter` 真正擅长的场景（不规则写地址，按 lane 批量写）
+- 并且会做 warmup + 多次重复取平均，减少“单次调用开销/仿真噪声”的影响
+
 ### 如何迁移到你的工程
 
 你需要把这个 demo 的两个部分“拷贝式迁移”：

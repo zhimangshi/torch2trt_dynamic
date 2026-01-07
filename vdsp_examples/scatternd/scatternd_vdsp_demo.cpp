@@ -210,20 +210,22 @@ int main(void) {
     INIT_TIMER0();
 
     // Example:
-    // output shape [H, W] = [8, 16] -> R=2, total=128
-    // indices [N, K] where K=1 means we write a full row slice of length W (slice_size=16).
-    // This matches typical scatter_nd "update a row" use-case and shows slice vectorization.
-    const int32_t out_shape[2] = {8, 16};
+    // Random point scatter:
+    // output shape [H, W] = [64, 64] -> R=2, total=4096
+    // K == R means slice_size == 1 (each index writes exactly 1 element).
+    // This is the case where vscatter batching is the right SIMD primitive.
+    const int32_t out_shape[2] = {64, 64};
     const int R = 2;
-    const int K = 1;
-    const int N = 6;
+    const int K = 2;
+    const int N = 4096;
+    const int REPEATS = 200;
 
     // Allocate in VCCM for performance.
     // NOTE: do not put `__vccm` on *local variable declarations*; keep it on
     // casts/usages instead.
     int8_t* out_v = (int8_t*)__vccm_alloca(out_shape[0] * out_shape[1] * sizeof(int8_t));
     int32_t* idx_v = (int32_t*)__vccm_alloca(N * K * sizeof(int32_t));
-    int8_t* upd_v = (int8_t*)__vccm_alloca(N * out_shape[1] * sizeof(int8_t));
+    int8_t* upd_v = (int8_t*)__vccm_alloca(N * sizeof(int8_t));  // slice_size==1
 
     if (!out_v || !idx_v || !upd_v) {
         printf("VCCM alloc failed\n");
@@ -233,7 +235,7 @@ int main(void) {
     // Allocate DDR buffers for scalar reference timing (avoid VCCM access effects).
     int8_t* out_ref = (int8_t*)malloc(out_shape[0] * out_shape[1] * sizeof(int8_t));
     int32_t* idx_ref = (int32_t*)malloc(N * K * sizeof(int32_t));
-    int8_t* upd_ref = (int8_t*)malloc(N * out_shape[1] * sizeof(int8_t));
+    int8_t* upd_ref = (int8_t*)malloc(N * sizeof(int8_t));
     if (!out_ref || !idx_ref || !upd_ref) {
         printf("DDR alloc failed\n");
         free(out_ref);
@@ -246,36 +248,51 @@ int main(void) {
     for (int i = 0; i < out_shape[0] * out_shape[1]; ++i) out_v[i] = 0;
     memset(out_ref, 0, out_shape[0] * out_shape[1] * sizeof(int8_t));
 
-    // Fill indices: choose rows 0, 2, 3, 7, 2 (duplicate), 5
-    idx_v[0] = 0;
-    idx_v[1] = 2;
-    idx_v[2] = 3;
-    idx_v[3] = 7;
-    idx_v[4] = 2;
-    idx_v[5] = 5;
-    for (int i = 0; i < N * K; ++i) idx_ref[i] = idx_v[i];
-
-    // Fill updates: each update is a row slice (16 bytes)
+    // Fill random indices + updates (deterministic seed for reproducibility).
+    // indices are in-range by construction.
+    srand(1);
     for (int n = 0; n < N; ++n) {
-        for (int j = 0; j < out_shape[1]; ++j) {
-            upd_v[n * out_shape[1] + j] = (int8_t)(n * 10 + j);
-            upd_ref[n * out_shape[1] + j] = upd_v[n * out_shape[1] + j];
-        }
+        const int32_t r = (int32_t)(rand() % out_shape[0]);
+        const int32_t c = (int32_t)(rand() % out_shape[1]);
+        idx_v[n * K + 0] = r;
+        idx_v[n * K + 1] = c;
+        idx_ref[n * K + 0] = r;
+        idx_ref[n * K + 1] = c;
+
+        const int8_t v = (int8_t)((rand() % 255) - 128);
+        upd_v[n] = v;
+        upd_ref[n] = v;
     }
 
-    // Run scalar reference with timing
+    // Warmup (avoid measuring cold-start effects)
+    scatternd_ref_i8(out_ref, out_shape, R, idx_ref, N, K, upd_ref);
+    scatternd_vdsp_i8((int8_t __vccm*)out_v, out_shape, R, (const int32_t __vccm*)idx_v, N, K, (const int8_t __vccm*)upd_v);
+
+    // Time scalar reference (repeat and average)
     RESET_TIMER0();
     const uint32_t tr0 = READ_TIMER0();
-    scatternd_ref_i8(out_ref, out_shape, R, idx_ref, N, K, upd_ref);
+    for (int it = 0; it < REPEATS; ++it) {
+        scatternd_ref_i8(out_ref, out_shape, R, idx_ref, N, K, upd_ref);
+    }
     const uint32_t tr1 = READ_TIMER0();
-    printf("REF  cycles: %u\n", (unsigned)(tr1 - tr0));
+    const uint32_t ref_cycles_total = (uint32_t)(tr1 - tr0);
+    printf("REF  cycles: %u (avg %u over %d)\n",
+           (unsigned)ref_cycles_total,
+           (unsigned)(ref_cycles_total / (uint32_t)REPEATS),
+           REPEATS);
 
     // Run VDSP kernel with timing
     RESET_TIMER0();
     const uint32_t t0 = READ_TIMER0();
-    scatternd_vdsp_i8((int8_t __vccm*)out_v, out_shape, R, (const int32_t __vccm*)idx_v, N, K, (const int8_t __vccm*)upd_v);
+    for (int it = 0; it < REPEATS; ++it) {
+        scatternd_vdsp_i8((int8_t __vccm*)out_v, out_shape, R, (const int32_t __vccm*)idx_v, N, K, (const int8_t __vccm*)upd_v);
+    }
     const uint32_t t1 = READ_TIMER0();
-    printf("VDSP cycles: %u\n", (unsigned)(t1 - t0));
+    const uint32_t vdsp_cycles_total = (uint32_t)(t1 - t0);
+    printf("VDSP cycles: %u (avg %u over %d)\n",
+           (unsigned)vdsp_cycles_total,
+           (unsigned)(vdsp_cycles_total / (uint32_t)REPEATS),
+           REPEATS);
 
     int mism = 0;
     for (int i = 0; i < 128; ++i) {
@@ -288,10 +305,10 @@ int main(void) {
     }
     printf("Check: %s (mismatches=%d)\n", mism ? "FAIL" : "OK", mism);
 
-    // Print one row to visualize last-write-wins for duplicate row=2
-    printf("Row 2 after scatter (should match last update with index=2):\n");
-    for (int j = 0; j < out_shape[1]; ++j) {
-        printf("%d ", (int)out_v[2 * out_shape[1] + j]);
+    // Print a few positions for quick visual sanity.
+    printf("Sample outputs (linear idx 0..15):\n");
+    for (int j = 0; j < 16; ++j) {
+        printf("%d ", (int)out_v[j]);
     }
     printf("\n");
 
