@@ -230,8 +230,21 @@ int main(void) {
         return -1;
     }
 
+    // Allocate DDR buffers for scalar reference timing (avoid VCCM access effects).
+    int8_t* out_ref = (int8_t*)malloc(out_shape[0] * out_shape[1] * sizeof(int8_t));
+    int32_t* idx_ref = (int32_t*)malloc(N * K * sizeof(int32_t));
+    int8_t* upd_ref = (int8_t*)malloc(N * out_shape[1] * sizeof(int8_t));
+    if (!out_ref || !idx_ref || !upd_ref) {
+        printf("DDR alloc failed\n");
+        free(out_ref);
+        free(idx_ref);
+        free(upd_ref);
+        return -1;
+    }
+
     // Init output to zeros
     for (int i = 0; i < out_shape[0] * out_shape[1]; ++i) out_v[i] = 0;
+    memset(out_ref, 0, out_shape[0] * out_shape[1] * sizeof(int8_t));
 
     // Fill indices: choose rows 0, 2, 3, 7, 2 (duplicate), 5
     idx_v[0] = 0;
@@ -240,13 +253,22 @@ int main(void) {
     idx_v[3] = 7;
     idx_v[4] = 2;
     idx_v[5] = 5;
+    for (int i = 0; i < N * K; ++i) idx_ref[i] = idx_v[i];
 
     // Fill updates: each update is a row slice (16 bytes)
     for (int n = 0; n < N; ++n) {
         for (int j = 0; j < out_shape[1]; ++j) {
             upd_v[n * out_shape[1] + j] = (int8_t)(n * 10 + j);
+            upd_ref[n * out_shape[1] + j] = upd_v[n * out_shape[1] + j];
         }
     }
+
+    // Run scalar reference with timing
+    RESET_TIMER0();
+    const uint32_t tr0 = READ_TIMER0();
+    scatternd_ref_i8(out_ref, out_shape, R, idx_ref, N, K, upd_ref);
+    const uint32_t tr1 = READ_TIMER0();
+    printf("REF  cycles: %u\n", (unsigned)(tr1 - tr0));
 
     // Run VDSP kernel with timing
     RESET_TIMER0();
@@ -254,11 +276,6 @@ int main(void) {
     scatternd_vdsp_i8((int8_t __vccm*)out_v, out_shape, R, (const int32_t __vccm*)idx_v, N, K, (const int8_t __vccm*)upd_v);
     const uint32_t t1 = READ_TIMER0();
     printf("VDSP cycles: %u\n", (unsigned)(t1 - t0));
-
-    // Quick scalar ref check in DDR (for demo correctness)
-    int8_t out_ref[128];
-    memset(out_ref, 0, sizeof(out_ref));
-    scatternd_ref_i8(out_ref, out_shape, R, (const int32_t*)idx_v, N, K, (const int8_t*)upd_v);
 
     int mism = 0;
     for (int i = 0; i < 128; ++i) {
@@ -277,6 +294,10 @@ int main(void) {
         printf("%d ", (int)out_v[2 * out_shape[1] + j]);
     }
     printf("\n");
+
+    free(out_ref);
+    free(idx_ref);
+    free(upd_ref);
 
     printf("ScatterND demo ended\n");
     return 0;
