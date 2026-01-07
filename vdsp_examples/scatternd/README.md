@@ -1,12 +1,16 @@
 ## ScatterND（VDSP 向量化）初版说明
 
-这个目录提供一个 **ScatterND 的最小可运行骨架**，用于你在 Synopsys VDSP 仿真器里快速起步：
+这个目录提供一个 **ScatterND 的可运行骨架（custom-op 风格）**，用于你在 Synopsys VDSP 仿真器里快速起步：
 
 - 文件：`scatternd_vdsp_demo.cpp`
 - 包含：
-  - **标量参考实现**（便于对照正确性）
-  - **VDSP 向量实现**（核心用 `vscatter` + predicate tail）
-  - **简单 demo main**（初始化数据、计时、对比 ref）
+  - **朴素标量 ref**：严格走“多重循环 copy + 多重循环更新”的结构（对齐 custom-op 写法）
+  - **优化/向量版**：
+    - copy：`memcpy`（替代 ref 的逐元素 copy）
+    - update：
+      - `slice_size==1 (K==rank)`：`vscatter` 批量随机点写（reduction=none）
+      - `slice_size>1 (K<rank)`：`memcpy` 复制连续 slice（reduction=none）
+  - **demo main**：会自动跑多个 (rank,K) case，打印 ref/vdsp cycles 与正确性
 
 ### 当前支持范围（v1）
 
@@ -40,14 +44,12 @@ ScatterND 的难点是 **写地址不规则（随机写）**：
 
 ### 当前 demo 默认测试用例（便于看性能差异）
 
-`scatternd_vdsp_demo.cpp` 现在默认用一个更贴近你“custom-op 循环实现”的配置来测量：
+`scatternd_vdsp_demo.cpp` 现在默认会跑多个 case 来覆盖 `indx_most_inner_dim (K)=1..rank`：
 
-- **rank=5 输入/输出**：`[2,4,8,8,64]`（总元素 32768）
-- **indices rank=5**：`[1,1,1,8192,5]`（K==5 ⇒ `slice_size==1` 的随机点写）
-- **updates rank=5**：`[1,1,1,8192,1]`
+- 覆盖 **rank=3** 与 **rank=5** 两组示例，并分别跑 `K=1..rank`
 - **reduction=none**（覆盖写）
-- ref 会用 **5 重循环逐元素 copy**（对齐你给的参考实现结构）；VDSP 版本 copy 用 `memcpy`，更新用 `vscatter` 批量写。
-- 计时采用 warmup + 多次重复取平均，减少噪声。
+- ref：逐元素 copy + 逐元素更新（慢）
+- VDSP：`memcpy` +（`vscatter` 或 slice `memcpy`）（快）
 
 ### 如何迁移到你的工程
 
