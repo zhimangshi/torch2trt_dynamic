@@ -168,7 +168,10 @@ static void scatternd_vdsp_i8(
             base += indices[i * K + d] * strides[d];
         }
 
-        const int8_t* __vccm up = (const int8_t __vccm*)&updates[i * slice_size];
+        // NOTE: ARC/VDSP toolchains often forbid address-space qualifiers on
+        // automatic (local) variables. `updates` is already a __vccm pointer
+        // as a parameter, so keep the local pointer unqualified.
+        const int8_t* up = (const int8_t*)&updates[i * slice_size];
 
         int t = 0;
         for (; t + lanes <= slice_size; t += lanes) {
@@ -216,9 +219,11 @@ int main(void) {
     const int N = 6;
 
     // Allocate in VCCM for performance.
-    int8_t* __vccm out_v = (int8_t __vccm*)__vccm_alloca(out_shape[0] * out_shape[1] * sizeof(int8_t));
-    int32_t* __vccm idx_v = (int32_t __vccm*)__vccm_alloca(N * K * sizeof(int32_t));
-    int8_t* __vccm upd_v = (int8_t __vccm*)__vccm_alloca(N * out_shape[1] * sizeof(int8_t));
+    // NOTE: do not put `__vccm` on *local variable declarations*; keep it on
+    // casts/usages instead.
+    int8_t* out_v = (int8_t*)__vccm_alloca(out_shape[0] * out_shape[1] * sizeof(int8_t));
+    int32_t* idx_v = (int32_t*)__vccm_alloca(N * K * sizeof(int32_t));
+    int8_t* upd_v = (int8_t*)__vccm_alloca(N * out_shape[1] * sizeof(int8_t));
 
     if (!out_v || !idx_v || !upd_v) {
         printf("VCCM alloc failed\n");
@@ -246,7 +251,7 @@ int main(void) {
     // Run VDSP kernel with timing
     RESET_TIMER0();
     const uint32_t t0 = READ_TIMER0();
-    scatternd_vdsp_i8(out_v, out_shape, R, idx_v, N, K, upd_v);
+    scatternd_vdsp_i8((int8_t __vccm*)out_v, out_shape, R, (const int32_t __vccm*)idx_v, N, K, (const int8_t __vccm*)upd_v);
     const uint32_t t1 = READ_TIMER0();
     printf("VDSP cycles: %u\n", (unsigned)(t1 - t0));
 
