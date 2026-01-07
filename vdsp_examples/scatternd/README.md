@@ -40,10 +40,14 @@ ScatterND 的难点是 **写地址不规则（随机写）**：
 
 ### 当前 demo 默认测试用例（便于看性能差异）
 
-`scatternd_vdsp_demo.cpp` 现在默认用 **`K == R`（`slice_size == 1`）的大量随机点写** 来测量：
+`scatternd_vdsp_demo.cpp` 现在默认用一个更贴近你“custom-op 循环实现”的配置来测量：
 
-- 这是 `vscatter` 真正擅长的场景（不规则写地址，按 lane 批量写）
-- 并且会做 warmup + 多次重复取平均，减少“单次调用开销/仿真噪声”的影响
+- **rank=5 输入/输出**：`[2,4,8,8,64]`（总元素 32768）
+- **indices rank=5**：`[1,1,1,8192,5]`（K==5 ⇒ `slice_size==1` 的随机点写）
+- **updates rank=5**：`[1,1,1,8192,1]`
+- **reduction=none**（覆盖写）
+- ref 会用 **5 重循环逐元素 copy**（对齐你给的参考实现结构）；VDSP 版本 copy 用 `memcpy`，更新用 `vscatter` 批量写。
+- 计时采用 warmup + 多次重复取平均，减少噪声。
 
 ### 如何迁移到你的工程
 

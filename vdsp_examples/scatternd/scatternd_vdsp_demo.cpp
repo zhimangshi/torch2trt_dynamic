@@ -108,6 +108,146 @@ static void scatternd_ref_i8(
     }
 }
 
+// -----------------------------
+// Rank-5 "custom-op style" reference & vector versions (reduction = NONE only)
+// This mirrors the nested loops shape of the code snippet you provided.
+// -----------------------------
+
+// Fixed rank for this demo
+enum { RANK5 = 5 };
+
+static inline int32_t pos5(const int32_t* dims, int d0, int d1, int d2, int d3, int d4) {
+    // Row-major: ((((d0*D1 + d1)*D2 + d2)*D3 + d3)*D4 + d4)
+    return ((((d0 * dims[1] + d1) * dims[2] + d2) * dims[3] + d3) * dims[4] + d4);
+}
+
+// indices tensor layout for this demo: [I0, I1, I2, I3, K]
+static inline int32_t pos_idx5(const int32_t* idx_dims, int d0, int d1, int d2, int d3, int d4) {
+    return ((((d0 * idx_dims[1] + d1) * idx_dims[2] + d2) * idx_dims[3] + d3) * idx_dims[4] + d4);
+}
+
+// updates tensor layout for this demo: [I0, I1, I2, I3, 1] (slice_size==1)
+static inline int32_t pos_upd5(const int32_t* upd_dims, int d0, int d1, int d2, int d3, int d4) {
+    return ((((d0 * upd_dims[1] + d1) * upd_dims[2] + d2) * upd_dims[3] + d3) * upd_dims[4] + d4);
+}
+
+// Reference implementation that mirrors your snippet structure:
+// - Copy input -> output with 5 nested loops (intentionally "scalar/naive")
+// - Update output at positions selected by indices (K == 5 => slice_size == 1)
+// - reduction is NONE only (overwrite)
+static void scatternd_rank5_ref_i8_none(
+    const int8_t* input,
+    const int32_t* in_dims,              // [D0..D4]
+    const int64_t* indices,
+    const int32_t* idx_dims,             // [I0..I3,K]
+    const int8_t* updates,
+    const int32_t* upd_dims,             // [I0..I3,1]
+    int8_t* out
+) {
+    // Copy input -> output (5 nested loops)
+    for (uint32_t dim_0 = 0; dim_0 < (uint32_t)in_dims[0]; dim_0++) {
+        for (uint32_t dim_1 = 0; dim_1 < (uint32_t)in_dims[1]; dim_1++) {
+            for (uint32_t dim_2 = 0; dim_2 < (uint32_t)in_dims[2]; dim_2++) {
+                for (uint32_t dim_3 = 0; dim_3 < (uint32_t)in_dims[3]; dim_3++) {
+                    for (uint32_t dim_4 = 0; dim_4 < (uint32_t)in_dims[4]; dim_4++) {
+                        const int in_pos = pos5(in_dims, (int)dim_0, (int)dim_1, (int)dim_2, (int)dim_3, (int)dim_4);
+                        const int out_pos = in_pos;
+                        out[out_pos] = input[in_pos];
+                    }
+                }
+            }
+        }
+    }
+
+    // Update (K == 5 => write single element)
+    const uint32_t K = (uint32_t)idx_dims[4];
+    if (K != 5) {
+        printf("This demo ref implements K==5 only.\n");
+        return;
+    }
+
+    for (uint32_t dim_0 = 0; dim_0 < (uint32_t)idx_dims[0]; dim_0++) {
+        for (uint32_t dim_1 = 0; dim_1 < (uint32_t)idx_dims[1]; dim_1++) {
+            for (uint32_t dim_2 = 0; dim_2 < (uint32_t)idx_dims[2]; dim_2++) {
+                for (uint32_t dim_3 = 0; dim_3 < (uint32_t)idx_dims[3]; dim_3++) {
+                    const int selected_d1_idx = pos_idx5(idx_dims, (int)dim_0, (int)dim_1, (int)dim_2, (int)dim_3, 0);
+                    const int selected_d2_idx = pos_idx5(idx_dims, (int)dim_0, (int)dim_1, (int)dim_2, (int)dim_3, 1);
+                    const int selected_d3_idx = pos_idx5(idx_dims, (int)dim_0, (int)dim_1, (int)dim_2, (int)dim_3, 2);
+                    const int selected_d4_idx = pos_idx5(idx_dims, (int)dim_0, (int)dim_1, (int)dim_2, (int)dim_3, 3);
+                    const int selected_d5_idx = pos_idx5(idx_dims, (int)dim_0, (int)dim_1, (int)dim_2, (int)dim_3, 4);
+
+                    const int selected_d1 = (int)indices[selected_d1_idx];
+                    const int selected_d2 = (int)indices[selected_d2_idx];
+                    const int selected_d3 = (int)indices[selected_d3_idx];
+                    const int selected_d4 = (int)indices[selected_d4_idx];
+                    const int selected_d5 = (int)indices[selected_d5_idx];
+
+                    const int out_pos = pos5(in_dims, selected_d1, selected_d2, selected_d3, selected_d4, selected_d5);
+                    const int updates_pos = pos_upd5(upd_dims, (int)dim_0, (int)dim_1, (int)dim_2, (int)dim_3, 0);
+                    out[out_pos] = updates[updates_pos];  // reduction = NONE
+                }
+            }
+        }
+    }
+}
+
+// Vector version for the same rank-5 / K==5 / reduction=none case:
+// - Copy input->output using memcpy (fast baseline)
+// - Update using vscatter batching (random point writes)
+__attribute__((noinline))
+static void scatternd_rank5_vdsp_i8_none(
+    const int8_t* __vccm input,
+    const int32_t* in_dims,
+    const int64_t* __vccm indices,
+    const int32_t* idx_dims,
+    const int8_t* __vccm updates,
+    const int32_t* upd_dims,
+    int8_t* __vccm out
+) {
+    const int32_t total = prod_i32(in_dims, RANK5);
+    memcpy((void*)out, (const void*)input, (size_t)total);
+
+    const int K = idx_dims[4];
+    if (K != 5) {
+        printf("This demo VDSP implements K==5 only.\n");
+        return;
+    }
+
+    // Precompute strides for output position computation
+    int32_t strides[5];
+    compute_strides(in_dims, RANK5, strides);
+
+    const int lanes = _VDSP_NUM_8BIT_LANES;
+    const int N = idx_dims[0] * idx_dims[1] * idx_dims[2] * idx_dims[3];
+
+    // We treat indices as a flat AoS array of length N*K.
+    // Each update corresponds to indices[n, 0..4] and updates[n,0].
+    for (int i = 0; i < N; i += lanes) {
+        const int n = (N - i) > lanes ? lanes : (N - i);
+
+        int32_t offs[_VDSP_NUM_8BIT_LANES];
+        int8_t vals[_VDSP_NUM_8BIT_LANES];
+
+        for (int l = 0; l < n; ++l) {
+            const int row = i + l;
+            const int64_t d0 = indices[row * 5 + 0];
+            const int64_t d1 = indices[row * 5 + 1];
+            const int64_t d2 = indices[row * 5 + 2];
+            const int64_t d3 = indices[row * 5 + 3];
+            const int64_t d4 = indices[row * 5 + 4];
+
+            const int32_t base =
+                (int32_t)(d0 * strides[0] + d1 * strides[1] + d2 * strides[2] + d3 * strides[3] + d4 * strides[4]);
+            offs[l] = base;
+            vals[l] = updates[row];
+        }
+
+        const vNx4int_t vOffs = pack_offsets_nx4(offs, n);
+        const vNx4char_t vVals = pack_i8_nx4(vals, n);
+        vscatter(vVals, (int8_t __vccm*)out, vOffs, pred_n_lanes(n));
+    }
+}
+
 // VDSP vectorized scatter_nd for int8, reduction="none".
 // - Uses vscatter to batch irregular writes.
 // - Handles tails via predicate.
@@ -209,70 +349,88 @@ int main(void) {
     printf("ScatterND demo started\n");
     INIT_TIMER0();
 
-    // Example:
-    // Random point scatter:
-    // output shape [H, W] = [64, 64] -> R=2, total=4096
-    // K == R means slice_size == 1 (each index writes exactly 1 element).
-    // This is the case where vscatter batching is the right SIMD primitive.
-    const int32_t out_shape[2] = {64, 64};
-    const int R = 2;
-    const int K = 2;
-    const int N = 4096;
-    const int REPEATS = 200;
+    // Rank-5 demo configuration (matches the "custom-op" loop shape):
+    // input/output dims: [D0,D1,D2,D3,D4]
+    // indices dims:       [I0,I1,I2,I3,K] with K==5 (slice_size==1)
+    // updates dims:       [I0,I1,I2,I3,1]
+    //
+    // We choose sizes to:
+    // - make the ref copy loop expensive (5 nested loops)
+    // - keep buffers reasonable for VCCM
+    const int32_t io_dims[RANK5] = {2, 4, 8, 8, 64};  // total = 32768
+    const int32_t idx_dims[RANK5] = {1, 1, 1, 8192, 5};  // N = 8192 updates
+    const int32_t upd_dims[RANK5] = {1, 1, 1, 8192, 1};
+    const int REPEATS = 50;
 
-    // Allocate in VCCM for performance.
-    // NOTE: do not put `__vccm` on *local variable declarations*; keep it on
-    // casts/usages instead.
-    int8_t* out_v = (int8_t*)__vccm_alloca(out_shape[0] * out_shape[1] * sizeof(int8_t));
-    int32_t* idx_v = (int32_t*)__vccm_alloca(N * K * sizeof(int32_t));
-    int8_t* upd_v = (int8_t*)__vccm_alloca(N * sizeof(int8_t));  // slice_size==1
+    const int32_t total_io = prod_i32(io_dims, RANK5);
+    const int N = idx_dims[0] * idx_dims[1] * idx_dims[2] * idx_dims[3];
 
-    if (!out_v || !idx_v || !upd_v) {
+    // VCCM buffers (vector path)
+    int8_t* in_v = (int8_t*)__vccm_alloca((size_t)total_io * sizeof(int8_t));
+    int8_t* out_v = (int8_t*)__vccm_alloca((size_t)total_io * sizeof(int8_t));
+    int64_t* idx_v = (int64_t*)__vccm_alloca((size_t)N * 5 * sizeof(int64_t));
+    int8_t* upd_v = (int8_t*)__vccm_alloca((size_t)N * sizeof(int8_t));
+
+    if (!in_v || !out_v || !idx_v || !upd_v) {
         printf("VCCM alloc failed\n");
         return -1;
     }
 
-    // Allocate DDR buffers for scalar reference timing (avoid VCCM access effects).
-    int8_t* out_ref = (int8_t*)malloc(out_shape[0] * out_shape[1] * sizeof(int8_t));
-    int32_t* idx_ref = (int32_t*)malloc(N * K * sizeof(int32_t));
-    int8_t* upd_ref = (int8_t*)malloc(N * sizeof(int8_t));
-    if (!out_ref || !idx_ref || !upd_ref) {
+    // DDR buffers (reference path)
+    int8_t* in_ref = (int8_t*)malloc((size_t)total_io * sizeof(int8_t));
+    int8_t* out_ref = (int8_t*)malloc((size_t)total_io * sizeof(int8_t));
+    int64_t* idx_ref = (int64_t*)malloc((size_t)N * 5 * sizeof(int64_t));
+    int8_t* upd_ref = (int8_t*)malloc((size_t)N * sizeof(int8_t));
+    if (!in_ref || !out_ref || !idx_ref || !upd_ref) {
         printf("DDR alloc failed\n");
+        free(in_ref);
         free(out_ref);
         free(idx_ref);
         free(upd_ref);
         return -1;
     }
 
-    // Init output to zeros
-    for (int i = 0; i < out_shape[0] * out_shape[1]; ++i) out_v[i] = 0;
-    memset(out_ref, 0, out_shape[0] * out_shape[1] * sizeof(int8_t));
-
-    // Fill random indices + updates (deterministic seed for reproducibility).
-    // indices are in-range by construction.
+    // Initialize deterministic random data (same content for ref & vector paths)
     srand(1);
-    for (int n = 0; n < N; ++n) {
-        const int32_t r = (int32_t)(rand() % out_shape[0]);
-        const int32_t c = (int32_t)(rand() % out_shape[1]);
-        idx_v[n * K + 0] = r;
-        idx_v[n * K + 1] = c;
-        idx_ref[n * K + 0] = r;
-        idx_ref[n * K + 1] = c;
-
+    for (int i = 0; i < total_io; ++i) {
         const int8_t v = (int8_t)((rand() % 255) - 128);
-        upd_v[n] = v;
-        upd_ref[n] = v;
+        in_v[i] = v;
+        in_ref[i] = v;
     }
 
-    // Warmup (avoid measuring cold-start effects)
-    scatternd_ref_i8(out_ref, out_shape, R, idx_ref, N, K, upd_ref);
-    scatternd_vdsp_i8((int8_t __vccm*)out_v, out_shape, R, (const int32_t __vccm*)idx_v, N, K, (const int8_t __vccm*)upd_v);
+    for (int n = 0; n < N; ++n) {
+        // indices in-range for each of the 5 dims
+        const int64_t d0 = (int64_t)(rand() % io_dims[0]);
+        const int64_t d1 = (int64_t)(rand() % io_dims[1]);
+        const int64_t d2 = (int64_t)(rand() % io_dims[2]);
+        const int64_t d3 = (int64_t)(rand() % io_dims[3]);
+        const int64_t d4 = (int64_t)(rand() % io_dims[4]);
+        idx_v[n * 5 + 0] = d0;
+        idx_v[n * 5 + 1] = d1;
+        idx_v[n * 5 + 2] = d2;
+        idx_v[n * 5 + 3] = d3;
+        idx_v[n * 5 + 4] = d4;
+        idx_ref[n * 5 + 0] = d0;
+        idx_ref[n * 5 + 1] = d1;
+        idx_ref[n * 5 + 2] = d2;
+        idx_ref[n * 5 + 3] = d3;
+        idx_ref[n * 5 + 4] = d4;
 
-    // Time scalar reference (repeat and average)
+        const int8_t u = (int8_t)((rand() % 255) - 128);
+        upd_v[n] = u;
+        upd_ref[n] = u;
+    }
+
+    // Warmup
+    scatternd_rank5_ref_i8_none(in_ref, io_dims, idx_ref, idx_dims, upd_ref, upd_dims, out_ref);
+    scatternd_rank5_vdsp_i8_none((const int8_t __vccm*)in_v, io_dims, (const int64_t __vccm*)idx_v, idx_dims,
+                                 (const int8_t __vccm*)upd_v, upd_dims, (int8_t __vccm*)out_v);
+
+    // Time reference
     RESET_TIMER0();
     const uint32_t tr0 = READ_TIMER0();
     for (int it = 0; it < REPEATS; ++it) {
-        scatternd_ref_i8(out_ref, out_shape, R, idx_ref, N, K, upd_ref);
+        scatternd_rank5_ref_i8_none(in_ref, io_dims, idx_ref, idx_dims, upd_ref, upd_dims, out_ref);
     }
     const uint32_t tr1 = READ_TIMER0();
     const uint32_t ref_cycles_total = (uint32_t)(tr1 - tr0);
@@ -281,21 +439,23 @@ int main(void) {
            (unsigned)(ref_cycles_total / (uint32_t)REPEATS),
            REPEATS);
 
-    // Run VDSP kernel with timing
+    // Time VDSP
     RESET_TIMER0();
-    const uint32_t t0 = READ_TIMER0();
+    const uint32_t tv0 = READ_TIMER0();
     for (int it = 0; it < REPEATS; ++it) {
-        scatternd_vdsp_i8((int8_t __vccm*)out_v, out_shape, R, (const int32_t __vccm*)idx_v, N, K, (const int8_t __vccm*)upd_v);
+        scatternd_rank5_vdsp_i8_none((const int8_t __vccm*)in_v, io_dims, (const int64_t __vccm*)idx_v, idx_dims,
+                                     (const int8_t __vccm*)upd_v, upd_dims, (int8_t __vccm*)out_v);
     }
-    const uint32_t t1 = READ_TIMER0();
-    const uint32_t vdsp_cycles_total = (uint32_t)(t1 - t0);
+    const uint32_t tv1 = READ_TIMER0();
+    const uint32_t vdsp_cycles_total = (uint32_t)(tv1 - tv0);
     printf("VDSP cycles: %u (avg %u over %d)\n",
            (unsigned)vdsp_cycles_total,
            (unsigned)(vdsp_cycles_total / (uint32_t)REPEATS),
            REPEATS);
 
+    // Correctness check: compare entire output (same operation)
     int mism = 0;
-    for (int i = 0; i < 128; ++i) {
+    for (int i = 0; i < total_io; ++i) {
         if (out_ref[i] != out_v[i]) {
             if (mism < 8) {
                 printf("mismatch at %d: ref=%d vdsp=%d\n", i, (int)out_ref[i], (int)out_v[i]);
@@ -305,13 +465,14 @@ int main(void) {
     }
     printf("Check: %s (mismatches=%d)\n", mism ? "FAIL" : "OK", mism);
 
-    // Print a few positions for quick visual sanity.
+    // Print a few positions for quick sanity
     printf("Sample outputs (linear idx 0..15):\n");
     for (int j = 0; j < 16; ++j) {
         printf("%d ", (int)out_v[j]);
     }
     printf("\n");
 
+    free(in_ref);
     free(out_ref);
     free(idx_ref);
     free(upd_ref);
