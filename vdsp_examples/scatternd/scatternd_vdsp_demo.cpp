@@ -217,11 +217,11 @@ static void scatternd_custom_ref_i8_none(
 __attribute__((noinline))
 static void scatternd_custom_vdsp_i8_none(
     int rank,
-    const int8_t* __vccm input,
+    const int8_t* input,
     const int32_t* in_dims_in,
-    const int64_t* __vccm indices,
+    const int64_t* indices,
     const int32_t* idx_dims,
-    const int8_t* __vccm updates,
+    const int8_t* updates,
     const int32_t* upd_dims,
     int8_t* __vccm out
 ) {
@@ -415,6 +415,24 @@ int main(void) {
         {5, {2, 2, 4, 4, 32}, 5, 4096, 60},
     };
 
+    // IMPORTANT (toolchain constraint):
+    // Many ARC/VDSP link scripts limit .vstack (VCCM stack) to a small size (e.g. 0x4000).
+    // `__vccm_alloca` allocations accumulate until function returns, so allocating per-case in a loop
+    // can easily blow .vstack. We therefore allocate ONE reusable VCCM output buffer here.
+    int32_t max_total_io = 0;
+    for (unsigned ci = 0; ci < (unsigned)(sizeof(cases) / sizeof(cases[0])); ++ci) {
+        int32_t in_dims[5] = {1, 1, 1, 1, 1};
+        for (int i = 0; i < 5; ++i) in_dims[i] = cases[ci].dims[i];
+        const int32_t total_io = prod_i32(in_dims, RANK5);
+        if (total_io > max_total_io) max_total_io = total_io;
+    }
+    // Allocate output in VCCM once and reuse for all cases.
+    int8_t* out_v = (int8_t*)__vccm_alloca((size_t)max_total_io * sizeof(int8_t));
+    if (!out_v) {
+        printf("VCCM alloc failed for out_v (size=%d)\n", (int)max_total_io);
+        return -1;
+    }
+
     for (unsigned ci = 0; ci < (unsigned)(sizeof(cases) / sizeof(cases[0])); ++ci) {
         const Case tc = cases[ci];
         const int rank = tc.rank;
@@ -435,17 +453,7 @@ int main(void) {
 
         printf("\nCase rank=%d K=%d N=%d slice_size=%d total_io=%d\n", rank, K, N, (int)slice_size, (int)total_io);
 
-        // VCCM buffers (vector path)
-        int8_t* in_v = (int8_t*)__vccm_alloca((size_t)total_io * sizeof(int8_t));
-        int8_t* out_v = (int8_t*)__vccm_alloca((size_t)total_io * sizeof(int8_t));
-        int64_t* idx_v = (int64_t*)__vccm_alloca((size_t)N * K * sizeof(int64_t));
-        int8_t* upd_v = (int8_t*)__vccm_alloca((size_t)N * (size_t)slice_size * sizeof(int8_t));
-        if (!in_v || !out_v || !idx_v || !upd_v) {
-            printf("VCCM alloc failed for case %u\n", ci);
-            return -1;
-        }
-
-        // DDR buffers (reference path)
+        // DDR buffers (reference path + vector inputs)
         int8_t* in_ref = (int8_t*)malloc((size_t)total_io * sizeof(int8_t));
         int8_t* out_ref = (int8_t*)malloc((size_t)total_io * sizeof(int8_t));
         int64_t* idx_ref = (int64_t*)malloc((size_t)N * K * sizeof(int64_t));
@@ -463,7 +471,6 @@ int main(void) {
         srand(1 + (int)ci);
         for (int i = 0; i < total_io; ++i) {
             const int8_t v = (int8_t)((rand() % 255) - 128);
-            in_v[i] = v;
             in_ref[i] = v;
         }
 
@@ -471,20 +478,17 @@ int main(void) {
         for (int n = 0; n < N; ++n) {
             for (int k = 0; k < K; ++k) {
                 const int64_t d = (int64_t)(rand() % in_dims[k]);
-                idx_v[n * K + k] = d;
                 idx_ref[n * K + k] = d;
             }
             for (int t = 0; t < slice_size; ++t) {
                 const int8_t u = (int8_t)((rand() % 255) - 128);
-                upd_v[n * slice_size + t] = u;
                 upd_ref[n * slice_size + t] = u;
             }
         }
 
         // Warmup
         scatternd_custom_ref_i8_none(rank, in_ref, in_dims, idx_ref, idx_dims, upd_ref, upd_dims, out_ref);
-        scatternd_custom_vdsp_i8_none(rank, (const int8_t __vccm*)in_v, in_dims, (const int64_t __vccm*)idx_v, idx_dims,
-                                      (const int8_t __vccm*)upd_v, upd_dims, (int8_t __vccm*)out_v);
+        scatternd_custom_vdsp_i8_none(rank, in_ref, in_dims, idx_ref, idx_dims, upd_ref, upd_dims, (int8_t __vccm*)out_v);
 
         // Time reference
         RESET_TIMER0();
@@ -500,8 +504,8 @@ int main(void) {
         RESET_TIMER0();
         const uint32_t tv0 = READ_TIMER0();
         for (int it = 0; it < REPEATS; ++it) {
-            scatternd_custom_vdsp_i8_none(rank, (const int8_t __vccm*)in_v, in_dims, (const int64_t __vccm*)idx_v, idx_dims,
-                                          (const int8_t __vccm*)upd_v, upd_dims, (int8_t __vccm*)out_v);
+            scatternd_custom_vdsp_i8_none(rank, in_ref, in_dims, idx_ref, idx_dims,
+                                          upd_ref, upd_dims, (int8_t __vccm*)out_v);
         }
         const uint32_t tv1 = READ_TIMER0();
         const uint32_t vdsp_cycles_total = (uint32_t)(tv1 - tv0);
