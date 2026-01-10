@@ -253,29 +253,69 @@ static void scatternd_custom_vdsp_i8_none(
     const int slice_size = upd_dims[4];
 
     if (slice_size == 1) {
-        // Random point updates: vscatter batching.
-        // We treat indices as a flat AoS array of length N*K (K==rank here).
+        // Random point updates (K == rank): vscatter batching.
+        //
+        // Assumption for this optimized demo: indices have NO duplicates.
+        // Under this assumption we can safely batch vscatter without any conflict handling.
+        //
+        // Performance notes:
+        // - Only full vectors use vscatter (no predicate overhead).
+        // - Tail (< lanes) uses scalar stores to preserve correctness without relying on
+        //   predicated vscatter overload availability/stability.
         for (int i = 0; i < N; i += lanes) {
             const int n = (N - i) > lanes ? lanes : (N - i);
 
+            // Tail: scalar fallback (no predicate vscatter).
+            if (n != lanes) {
+                for (int l = 0; l < n; ++l) {
+                    const int row = i + l;
+                    int32_t base = 0;
+                    // Unrolled-ish: K is small (<=5). Keep a tight loop.
+                    for (int k = 0; k < K; ++k) {
+                        base += (int32_t)indices[row * K + k] * strides[k];
+                    }
+                    out[base] = updates[row];
+                }
+                continue;
+            }
+
+            // Full batch: build offsets/values then vscatter without predicate.
             int32_t offs[_VDSP_NUM_8BIT_LANES];
             int8_t vals[_VDSP_NUM_8BIT_LANES];
-
-            for (int l = 0; l < n; ++l) {
+            for (int l = 0; l < lanes; ++l) {
                 const int row = i + l;
-                int64_t d[5] = {0, 0, 0, 0, 0};
-                for (int k = 0; k < K; ++k) {
-                    d[k] = indices[row * K + k];
+                // Compute base offset for this lane (point update => base only).
+                // K==rank, but rank may be 1..5 in the surrounding demo.
+                int32_t base = 0;
+                // Manual unroll for common K values to reduce loop overhead.
+                if (K == 5) {
+                    base = (int32_t)indices[row * 5 + 0] * strides[0] +
+                           (int32_t)indices[row * 5 + 1] * strides[1] +
+                           (int32_t)indices[row * 5 + 2] * strides[2] +
+                           (int32_t)indices[row * 5 + 3] * strides[3] +
+                           (int32_t)indices[row * 5 + 4] * strides[4];
+                } else if (K == 4) {
+                    base = (int32_t)indices[row * 4 + 0] * strides[0] +
+                           (int32_t)indices[row * 4 + 1] * strides[1] +
+                           (int32_t)indices[row * 4 + 2] * strides[2] +
+                           (int32_t)indices[row * 4 + 3] * strides[3];
+                } else if (K == 3) {
+                    base = (int32_t)indices[row * 3 + 0] * strides[0] +
+                           (int32_t)indices[row * 3 + 1] * strides[1] +
+                           (int32_t)indices[row * 3 + 2] * strides[2];
+                } else if (K == 2) {
+                    base = (int32_t)indices[row * 2 + 0] * strides[0] +
+                           (int32_t)indices[row * 2 + 1] * strides[1];
+                } else { // K == 1
+                    base = (int32_t)indices[row] * strides[0];
                 }
-                const int32_t base = (int32_t)(d[0] * strides[0] + d[1] * strides[1] + d[2] * strides[2] +
-                                              d[3] * strides[3] + d[4] * strides[4]);
                 offs[l] = base;
                 vals[l] = updates[row];
             }
 
-            const vNx4int_t vOffs = pack_offsets_nx4(offs, n);
-            const vNx4char_t vVals = pack_i8_nx4(vals, n);
-            vscatter(vVals, (int8_t __vccm*)out, vOffs, pred_n_lanes(n));
+            const vNx4int_t vOffs = pack_offsets_nx4(offs, lanes);
+            const vNx4char_t vVals = pack_i8_nx4(vals, lanes);
+            vscatter(vVals, (int8_t __vccm*)out, vOffs);
         }
         return;
     }
